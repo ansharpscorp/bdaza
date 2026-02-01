@@ -1,0 +1,493 @@
+# ==========================================================
+# Databricks Notebook (PySpark)
+# Parquet (5-min) -> Delta (ADLS path + hive_metastore table abcdataall)
+#
+# Features:
+# 1) Backfill by DATE RANGE (start_date/end_date) OR last N days (backfill_days)
+# 2) Overwrite by DATE RANGE (overwrite_start_date/overwrite_end_date) OR explicit list overwrite_dates
+# 3) Incremental append of only NEW files using ingestion log (file-level)
+#    - Incremental processes BOTH yesterday + today (late-arrival handling)
+# 4) Two targets:
+#    A) ADLS Delta path (partitioned by year/month/day INT)
+#    B) hive_metastore Delta table abcdataall (partitioned by year/month/day)
+# 5) Schema driven by reference CSV (DataModelName, DataType) stored in ADLS
+# 6) Normalize column names (spaces -> _)
+# 7) Auto-detect safeguard: parse ISO/Zulu timestamps only if regex matches, else NULL
+#
+# NOTE: Delta stores timestamps as timestamp type; formatting happens at query time.
+# ==========================================================
+
+from pyspark.sql import functions as F
+from delta.tables import DeltaTable
+from datetime import datetime, timedelta, timezone
+import re
+
+# -----------------------------
+# 0) Widgets / Parameters
+# -----------------------------
+try:
+    dbutils.widgets.text("run_mode", "incremental")       # incremental | backfill | auto
+    dbutils.widgets.text("process_date", "")              # YYYY-MM-DD (single day override for incremental testing)
+    dbutils.widgets.text("start_date", "")                # YYYY-MM-DD (backfill range)
+    dbutils.widgets.text("end_date", "")                  # YYYY-MM-DD (backfill range)
+    dbutils.widgets.text("backfill_days", "0")            # fallback backfill if start/end not provided
+    dbutils.widgets.text("overwrite_dates", "")           # comma-separated YYYY-MM-DD (explicit overwrite list)
+    dbutils.widgets.text("overwrite_start_date", "")      # YYYY-MM-DD (overwrite range)
+    dbutils.widgets.text("overwrite_end_date", "")        # YYYY-MM-DD (overwrite range)
+except:
+    pass
+
+run_mode = (dbutils.widgets.get("run_mode") or "auto").strip().lower()
+process_date = (dbutils.widgets.get("process_date") or "").strip()
+start_date   = (dbutils.widgets.get("start_date") or "").strip()
+end_date     = (dbutils.widgets.get("end_date") or "").strip()
+backfill_days = int(((dbutils.widgets.get("backfill_days") or "0").strip()) or "0")
+
+overwrite_dates_csv = (dbutils.widgets.get("overwrite_dates") or "").strip()
+overwrite_start_date = (dbutils.widgets.get("overwrite_start_date") or "").strip()
+overwrite_end_date   = (dbutils.widgets.get("overwrite_end_date") or "").strip()
+
+overwrite_dates_list = [d.strip() for d in overwrite_dates_csv.split(",") if d.strip()]
+
+# -----------------------------
+# 1) Paths / Targets (EDIT THESE)
+# -----------------------------
+storage_account = "<storage_account_name>"
+src_container   = "<source_container>"
+tgt_container   = "<target_container>"
+
+src_root_folder = "<source_root_folder>"  # folder under container
+tgt_root_folder = "<target_root_folder>"
+
+src_root = f"abfss://{src_container}@{storage_account}.dfs.core.windows.net/{src_root_folder}".rstrip("/")
+tgt_root = f"abfss://{tgt_container}@{storage_account}.dfs.core.windows.net/{tgt_root_folder}".rstrip("/")
+
+# ADLS Delta target root (partitioned)
+delta_data_path = f"{tgt_root}/delta_table"
+
+# Ingestion log (file-level)
+delta_log_path  = f"{tgt_root}/_ingestion_log"
+
+# legacy hive_metastore Delta table
+hive_table_name = "abcdataall"   # or "default.abcdataall"
+
+# Reference schema CSV path in storage (DataModelName,DataType)
+schema_csv_path = "abfss://<container>@<account>.dfs.core.windows.net/<folder>/reference.csv"
+
+# Source file pattern
+file_prefix = "ABC_"
+file_ext = ".parquet"
+
+# Optional: convert "Date" string -> date type
+CONVERT_DATE_STRING_TO_DATE = True  # set False if you want Date as string
+
+# Incremental late-arrival window (days back from today). 1 => yesterday+today
+INCREMENTAL_LOOKBACK_DAYS = 1
+
+# -----------------------------
+# 2) Column-name normalization
+# -----------------------------
+def normalize_col_name(name: str) -> str:
+    name = (name or "").strip().replace(" ", "_")
+    name = re.sub(r"[^0-9A-Za-z_]", "_", name)
+    name = re.sub(r"_+", "_", name)
+    return name
+
+def normalize_df_columns(df):
+    for c in df.columns:
+        df = df.withColumnRenamed(c, normalize_col_name(c))
+    return df
+
+# -----------------------------
+# 3) Date helpers
+# -----------------------------
+def parse_ymd(date_str: str):
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    return dt.strftime("%Y"), dt.strftime("%m"), dt.strftime("%d")
+
+def parse_dt(date_str: str):
+    return datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+def daterange_str(start_str: str, end_str: str):
+    sdt = parse_dt(start_str)
+    edt = parse_dt(end_str)
+    if edt < sdt:
+        raise ValueError(f"end_date ({end_str}) must be >= start_date ({start_str})")
+    out = []
+    cur = sdt
+    while cur <= edt:
+        out.append(cur.strftime("%Y-%m-%d"))
+        cur += timedelta(days=1)
+    return out
+
+def today0_utc():
+    utc_today = datetime.now(timezone.utc).date()
+    return datetime(utc_today.year, utc_today.month, utc_today.day, tzinfo=timezone.utc)
+
+def today_str_utc():
+    return today0_utc().strftime("%Y-%m-%d")
+
+# -----------------------------
+# 4) Decide overwrite set + processing dates
+# -----------------------------
+def build_overwrite_set():
+    ow = set(overwrite_dates_list)
+    if overwrite_start_date and overwrite_end_date:
+        ow.update(daterange_str(overwrite_start_date, overwrite_end_date))
+    return ow
+
+overwrite_set = build_overwrite_set()
+
+def incremental_dates_yesterday_today():
+    """
+    Returns [yesterday, today] by default (lookback=1).
+    If process_date is supplied, treat it as the "today" anchor
+      - process_date and previous INCREMENTAL_LOOKBACK_DAYS days
+    """
+    if process_date:
+        anchor = parse_dt(process_date)
+    else:
+        anchor = today0_utc()
+
+    # include anchor day and lookback days before it
+    dates = []
+    for i in range(INCREMENTAL_LOOKBACK_DAYS, -1, -1):
+        d = anchor - timedelta(days=i)
+        dates.append(d.strftime("%Y-%m-%d"))
+    return dates
+
+def decide_dates_to_process():
+    # Priority of date selection:
+    # - If overwrite_set exists: process those dates (overwrite mode)
+    # - Else if start_date/end_date: process range (backfill mode)
+    # - Else if backfill_days > 0: process last N days (backfill mode)
+    # - Else if run_mode == incremental: yesterday+today (late-arrival handling)
+    # - Else if process_date: that day
+    # - Else: today
+    if overwrite_set:
+        return sorted(list(overwrite_set))
+
+    if start_date and end_date:
+        return daterange_str(start_date, end_date)
+
+    if backfill_days and backfill_days > 0:
+        anchor = today0_utc()
+        sdt = anchor - timedelta(days=backfill_days - 1)
+        return [(sdt + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(backfill_days)]
+
+    if run_mode == "incremental":
+        return incremental_dates_yesterday_today()
+
+    if process_date:
+        return [process_date]
+
+    return [today_str_utc()]
+
+dates_to_process = decide_dates_to_process()
+
+print("run_mode:", run_mode)
+print("overwrite_set size:", len(overwrite_set))
+print("dates_to_process count:", len(dates_to_process))
+print("dates_to_process:", dates_to_process)
+
+# -----------------------------
+# 5) Source file listing
+# -----------------------------
+def src_day_path(date_str: str) -> str:
+    y, m, d = parse_ymd(date_str)
+    return f"{src_root}/{y}/{m}/{d}"
+
+def list_source_files_for_date(date_str: str):
+    """
+    returns list of (file_path, modificationTime_ms)
+    """
+    day_path = src_day_path(date_str)
+    try:
+        items = dbutils.fs.ls(day_path)
+    except Exception:
+        return []
+
+    files = []
+    for it in items:
+        if it.isDir():
+            continue
+        if it.name.startswith(file_prefix) and it.name.endswith(file_ext):
+            files.append((it.path, it.modificationTime))
+    return files
+
+# -----------------------------
+# 6) Ingestion log (file-level)
+# -----------------------------
+def ensure_ingestion_log():
+    try:
+        spark.read.format("delta").load(delta_log_path).limit(1).count()
+    except Exception:
+        empty = spark.createDataFrame([], "date string, file_path string, file_mod_time long, processed_at timestamp")
+        empty.write.format("delta").mode("overwrite").save(delta_log_path)
+
+def processed_files_for_date(date_str: str):
+    try:
+        df = (spark.read.format("delta").load(delta_log_path)
+              .where(F.col("date") == date_str)
+              .select("file_path"))
+        return set(r["file_path"] for r in df.collect())
+    except Exception:
+        return set()
+
+def delete_log_for_dates(dates):
+    try:
+        dt = DeltaTable.forPath(spark, delta_log_path)
+        dt.delete(F.col("date").isin(dates))
+    except Exception:
+        pass
+
+def append_log(date_str: str, file_rows):
+    if not file_rows:
+        return
+    log_df = (spark.createDataFrame(
+                [(date_str, p, mt) for (p, mt) in file_rows],
+                "date string, file_path string, file_mod_time long")
+              .withColumn("processed_at", F.current_timestamp()))
+    log_df.write.format("delta").mode("append").save(delta_log_path)
+
+ensure_ingestion_log()
+
+# -----------------------------
+# 7) Reference schema load + ISO/Zulu safeguard parsing
+# -----------------------------
+TYPE_MAP = {
+    "string": "string",
+    "boolean": "boolean",
+    "bool": "boolean",
+    "int": "int",
+    "integer": "int",
+    "bigint": "bigint",
+    "long": "bigint",
+    "double": "double",
+    "float": "float",
+    "date": "date",
+    "timestamp": "timestamp"
+}
+
+# Allowlist of columns you want stored as timestamp even if reference says "String"
+ZULU_TIME_COL_ALLOWLIST = {
+    "Start_Time",
+    "End_Time",
+    "Auto_Attendant_Chain_Start_Time",
+}
+
+# ISO/Zulu regex guard: 2026-01-01T10:20:30(.123)?(Z|+00:00)
+ISO_ZULU_REGEX = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+\-]\d{2}:\d{2})$"
+
+def load_schema_with_overrides(schema_path: str):
+    ref = (spark.read.option("header", "true").csv(schema_path)
+           .select(F.col("DataModelName").alias("name"),
+                   F.lower(F.col("DataType")).alias("dtype")))
+
+    rows = ref.collect()
+
+    ordered = []
+    for r in rows:
+        raw_name = (r["name"] or "").strip()
+        raw_type = (r["dtype"] or "").strip()
+        if not raw_name or not raw_type:
+            continue
+
+        col = normalize_col_name(raw_name)
+        if raw_type not in TYPE_MAP:
+            raise ValueError(f"Unknown DataType in reference CSV: {raw_type} for column {raw_name}")
+
+        dtype = TYPE_MAP[raw_type]
+
+        # Override string->timestamp for allowlisted columns
+        if dtype == "string" and col in ZULU_TIME_COL_ALLOWLIST:
+            dtype = "timestamp"
+
+        # Optional override string->date for Date column
+        if CONVERT_DATE_STRING_TO_DATE and col == "Date" and dtype == "string":
+            dtype = "date"
+
+        ordered.append((col, dtype))
+
+    return ordered
+
+ordered_schema = load_schema_with_overrides(schema_csv_path)
+print("Loaded reference columns:", len(ordered_schema))
+
+def parse_iso_zulu_to_timestamp(col_expr):
+    """
+    Auto-detect safeguard:
+      - Only parse when regexp_like matches ISO_ZULU_REGEX
+      - Otherwise return NULL (prevents wrong casts from junk strings)
+    """
+    guarded = F.when(F.regexp_like(col_expr, ISO_ZULU_REGEX), col_expr)
+
+    return F.coalesce(
+        F.to_timestamp(guarded, "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"),
+        F.to_timestamp(guarded, "yyyy-MM-dd'T'HH:mm:ssXXX"),
+        F.to_timestamp(guarded, "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"),
+        F.to_timestamp(guarded, "yyyy-MM-dd'T'HH:mm:ss'Z'"),
+        F.to_timestamp(guarded)
+    )
+
+def enforce_schema(df, ordered_schema):
+    df = normalize_df_columns(df)
+    df_cols = set(df.columns)
+
+    for col, dtype in ordered_schema:
+        if col not in df_cols:
+            df = df.withColumn(col, F.lit(None).cast(dtype))
+        else:
+            if dtype == "timestamp":
+                df = df.withColumn(col, parse_iso_zulu_to_timestamp(F.col(col)).cast("timestamp"))
+            elif dtype == "date":
+                df = df.withColumn(col, F.to_date(F.col(col), "yyyy-MM-dd"))
+            else:
+                df = df.withColumn(col, F.col(col).cast(dtype))
+
+    return df
+
+# -----------------------------
+# 8) Dataframe builder for a date
+# -----------------------------
+def load_files_as_df(files, date_str: str):
+    paths = [p for (p, _) in files]
+    if not paths:
+        return None
+
+    df = spark.read.format("parquet").load(paths)
+
+    # Normalize + enforce schema + parse timestamps safely
+    df = enforce_schema(df, ordered_schema)
+
+    # Add partition columns as INT
+    y, m, d = parse_ymd(date_str)
+    df = (df
+          .withColumn("year",  F.lit(int(y)).cast("int"))
+          .withColumn("month", F.lit(int(m)).cast("int"))
+          .withColumn("day",   F.lit(int(d)).cast("int"))
+         )
+    return df
+
+# -----------------------------
+# 9) Target A: ADLS Delta path writes
+# -----------------------------
+def write_storage_overwrite_partition(df, date_str: str):
+    y, m, d = parse_ymd(date_str)
+    replace_where = f"year = {int(y)} AND month = {int(m)} AND day = {int(d)}"
+
+    (df.write.format("delta")
+       .mode("overwrite")
+       .option("replaceWhere", replace_where)
+       .option("mergeSchema", "true")
+       .partitionBy("year", "month", "day")
+       .save(delta_data_path))
+
+def write_storage_append(df):
+    (df.write.format("delta")
+       .mode("append")
+       .option("mergeSchema", "true")
+       .partitionBy("year", "month", "day")
+       .save(delta_data_path)
+
+# -----------------------------
+# 10) Target B: hive_metastore abcdataall writes
+# -----------------------------
+def hive_table_exists(table_name: str) -> bool:
+    try:
+        spark.table(table_name).limit(1).count()
+        return True
+    except Exception:
+        return False
+
+def ensure_hive_table_created(df):
+    if hive_table_exists(hive_table_name):
+        return
+    (df.write.format("delta")
+       .mode("overwrite")
+       .option("overwriteSchema", "true")
+       .partitionBy("year", "month", "day")
+       .saveAsTable(hive_table_name))
+
+def hive_overwrite_partition(df, date_str: str):
+    y, m, d = parse_ymd(date_str)
+    cond = f"year = {int(y)} AND month = {int(m)} AND day = {int(d)}"
+
+    if hive_table_exists(hive_table_name):
+        DeltaTable.forName(spark, hive_table_name).delete(cond)
+        (df.write.format("delta")
+           .mode("append")
+           .option("mergeSchema", "true")
+           .saveAsTable(hive_table_name))
+    else:
+        ensure_hive_table_created(df)
+
+def hive_append(df):
+    if hive_table_exists(hive_table_name):
+        (df.write.format("delta")
+           .mode("append")
+           .option("mergeSchema", "true")
+           .saveAsTable(hive_table_name))
+    else:
+        ensure_hive_table_created(df)
+
+# -----------------------------
+# 11) Main processing loop
+# -----------------------------
+def is_overwrite_day(date_str: str) -> bool:
+    return date_str in overwrite_set
+
+for dt_str in dates_to_process:
+    print(f"\n=== Processing date: {dt_str} ===")
+
+    src_files = list_source_files_for_date(dt_str)
+    if not src_files:
+        print(f"No source files found at: {src_day_path(dt_str)}")
+        continue
+
+    if is_overwrite_day(dt_str):
+        # Overwrite: re-ingest ALL files for that day, replace partition in both targets, reset log
+        df_all = load_files_as_df(src_files, dt_str)
+        if df_all is None:
+            print("No data to overwrite.")
+            continue
+
+        write_storage_overwrite_partition(df_all, dt_str)
+        hive_overwrite_partition(df_all, dt_str)
+
+        delete_log_for_dates([dt_str])
+        append_log(dt_str, src_files)
+
+        print(f"OVERWRITE complete: {len(src_files)} files.")
+    else:
+        # Incremental: only ingest NEW files for that day (based on ingestion log)
+        already = processed_files_for_date(dt_str)
+        new_files = [(p, mt) for (p, mt) in src_files if p not in already]
+
+        if not new_files:
+            print(f"No new files to append. Total files present: {len(src_files)}")
+            continue
+
+        df_new = load_files_as_df(new_files, dt_str)
+        if df_new is None:
+            print("No new data to append.")
+            continue
+
+        write_storage_append(df_new)
+        hive_append(df_new)
+
+        append_log(dt_str, new_files)
+
+        print(f"APPEND complete: {len(new_files)} new files (out of {len(src_files)} present).")
+
+# -----------------------------
+# 12) Status/Flag output (latest files ingested)
+# -----------------------------
+log_df = spark.read.format("delta").load(delta_log_path)
+
+status_df = (log_df.groupBy("date")
+             .agg(F.countDistinct("file_path").alias("files_ingested"),
+                  F.max("processed_at").alias("last_ingested_at"))
+             .orderBy(F.col("date").desc()))
+
+display(status_df)
