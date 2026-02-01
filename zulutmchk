@@ -1,0 +1,57 @@
+# Accept 1..9 fractional digits; Z or ±HH:MM
+ISO_ZULU_REGEX = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+\-]\d{2}:\d{2})$"
+
+def normalize_iso_fraction_to_6(col_expr):
+    """
+    If fractional seconds exist:
+      - truncate/pad to exactly 6 digits (microseconds)
+    Keeps timezone suffix (Z or ±HH:MM).
+    Examples:
+      .1Z -> .100000Z
+      .123Z -> .123000Z
+      .123456789Z -> .123456Z
+      no fraction -> unchanged
+    """
+    # Build 6-digit fraction:
+    # group2 = fraction digits; pad with zeros to 6 then cut to 6
+    # group3 = timezone suffix
+    return F.regexp_replace(
+        col_expr,
+        r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.(\d{1,9})(Z|[+\-]\d{2}:\d{2})$",
+        r"\1.\2" + "000000" + r"\3"
+    ).alias("norm")
+
+def truncate_to_6_after_pad(col_expr):
+    """
+    After padding, truncate the fraction to 6 digits:
+    2026-...:30.123456000000Z -> 2026-...:30.123456Z
+    """
+    return F.regexp_replace(
+        col_expr,
+        r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6})\d+(Z|[+\-]\d{2}:\d{2})$",
+        r"\1\2"
+    )
+
+def parse_iso_zulu_to_timestamp(col_expr):
+    """
+    Auto-detect safeguard + microsecond normalization.
+    - Only parses if value matches ISO_ZULU_REGEX
+    - Normalizes fractional seconds to 6 digits
+    - Parses to timestamp
+    """
+    guarded = F.when(F.regexp_like(col_expr, ISO_ZULU_REGEX), col_expr)
+
+    # Normalize fraction if present, then truncate to 6 digits
+    norm1 = normalize_iso_fraction_to_6(guarded)
+    norm2 = truncate_to_6_after_pad(norm1)
+
+    return F.coalesce(
+        # with timezone offset
+        F.to_timestamp(norm2, "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX"),
+        # Zulu 'Z'
+        F.to_timestamp(norm2, "yyyy-MM-dd'T'HH:mm:ss.SSSSSS'Z'"),
+        # No fractional seconds
+        F.to_timestamp(guarded, "yyyy-MM-dd'T'HH:mm:ssXXX"),
+        F.to_timestamp(guarded, "yyyy-MM-dd'T'HH:mm:ss'Z'"),
+        F.to_timestamp(guarded)
+    )
