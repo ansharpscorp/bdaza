@@ -1,0 +1,242 @@
+python copy_csv_date_partitions.py --start-date 2026-01-01 --end-date 2026-01-07 --dry-run
+
+python copy_csv_date_partitions.py --start-date 2026-01-01 --end-date 2026-01-07
+python copy_csv_date_partitions.py --start-date 2026-01-01 --end-date 2026-01-07 --workers 48 --overwrite
+
+
+{
+  "auth": {
+    "tenant_id": "YOUR_TENANT_ID",
+    "client_id": "YOUR_APP_ID",
+    "client_secret": "YOUR_APP_SECRET"
+  },
+  "source": {
+    "account": "StorageAccountA",
+    "container": "ContainerA",
+    "folder": "FolderA"
+  },
+  "destination": {
+    "account": "StorageAccountB",
+    "container": "ContainerB",
+    "folder": "FolderB"
+  },
+  "run": {
+    "workers": 32,
+    "overwrite": false
+  }
+}
+
+import argparse
+import json
+import sys
+import time
+import random
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Tuple
+
+from azure.identity import ClientSecretCredential
+from azure.storage.blob import BlobServiceClient, ContentSettings
+
+
+# -------------------------
+# Helpers
+# -------------------------
+def norm_prefix(p: str) -> str:
+    if not p:
+        return ""
+    p = p.strip().lstrip("/")
+    return p if p.endswith("/") else (p + "/")
+
+def join_prefix(prefix: str, suffix: str) -> str:
+    prefix = norm_prefix(prefix)
+    suffix = suffix.lstrip("/")
+    return f"{prefix}{suffix}" if prefix else suffix
+
+def parse_date(s: str) -> datetime:
+    return datetime.strptime(s, "%Y-%m-%d")
+
+def daterange(start: datetime, end: datetime):
+    cur = start
+    while cur <= end:
+        yield cur
+        cur += timedelta(days=1)
+
+def retry(fn, *, tries=7, base=0.8, cap=20.0, jitter=0.25, what="operation"):
+    last = None
+    for attempt in range(1, tries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if attempt == tries:
+                break
+            sleep = min(cap, base * (2 ** (attempt - 1)))
+            sleep *= (1 + random.uniform(-jitter, jitter))
+            print(f"[retry] {what} failed (attempt {attempt}/{tries}): {e}. sleep={sleep:.2f}s", file=sys.stderr)
+            time.sleep(sleep)
+    raise last
+
+def build_bsc(account: str, credential: ClientSecretCredential) -> BlobServiceClient:
+    return BlobServiceClient(
+        account_url=f"https://{account}.blob.core.windows.net",
+        credential=credential
+    )
+
+def ensure_container_exists(container_client):
+    def _do():
+        try:
+            container_client.create_container()
+            print("[info] Destination container created.")
+        except Exception:
+            # already exists OR no create permission (if exists it's fine)
+            pass
+    retry(_do, what="ensure_container_exists")
+
+def list_csv_blobs_for_prefix(container_client, prefix: str) -> List[str]:
+    prefix = norm_prefix(prefix)
+    out = []
+    for b in container_client.list_blobs(name_starts_with=prefix):
+        if b.name.lower().endswith(".csv"):
+            out.append(b.name)
+    return out
+
+def copy_blob_streaming(src_blob_client, dst_blob_client, overwrite: bool) -> str:
+    def _do():
+        if not overwrite:
+            try:
+                dst_blob_client.get_blob_properties()
+                return "skipped_exists"
+            except Exception:
+                pass
+
+        src_props = src_blob_client.get_blob_properties()
+        ctype = getattr(src_props.content_settings, "content_type", None) or "text/csv"
+
+        downloader = src_blob_client.download_blob(max_concurrency=4)
+        dst_blob_client.upload_blob(
+            data=downloader,  # streaming download->upload
+            overwrite=True,
+            content_settings=ContentSettings(content_type=ctype),
+        )
+        return "copied"
+
+    return retry(_do, what=f"copy {src_blob_client.blob_name}")
+
+
+# -------------------------
+# Main
+# -------------------------
+def main():
+    ap = argparse.ArgumentParser(description="Copy date-partitioned CSV blobs between storage accounts (AAD client secret, no SAS).")
+    ap.add_argument("--config", default="config.json", help="Path to config.json")
+    ap.add_argument("--start-date", required=True, help="YYYY-MM-DD (inclusive)")
+    ap.add_argument("--end-date", required=True, help="YYYY-MM-DD (inclusive)")
+    ap.add_argument("--overwrite", action="store_true", help="Override config run.overwrite for this run")
+    ap.add_argument("--workers", type=int, default=None, help="Override config run.workers for this run")
+    ap.add_argument("--dry-run", action="store_true", help="Print plan only; do not copy")
+    args = ap.parse_args()
+
+    # Load config
+    with open(args.config, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    auth = cfg["auth"]
+    src = cfg["source"]
+    dst = cfg["destination"]
+    run_cfg = cfg.get("run", {})
+
+    overwrite = args.overwrite or bool(run_cfg.get("overwrite", False))
+    workers = args.workers if args.workers is not None else int(run_cfg.get("workers", 16))
+
+    start = parse_date(args.start_date)
+    end = parse_date(args.end_date)
+    if end < start:
+        raise ValueError("end-date must be >= start-date")
+
+    src_folder = norm_prefix(src.get("folder", ""))
+    dst_folder = norm_prefix(dst.get("folder", ""))
+
+    # One credential for both accounts
+    credential = ClientSecretCredential(
+        tenant_id=auth["tenant_id"],
+        client_id=auth["client_id"],
+        client_secret=auth["client_secret"]
+    )
+
+    src_bsc = build_bsc(src["account"], credential)
+    dst_bsc = build_bsc(dst["account"], credential)
+
+    src_cc = src_bsc.get_container_client(src["container"])
+    dst_cc = dst_bsc.get_container_client(dst["container"])
+    ensure_container_exists(dst_cc)
+
+    # Build copy plan: list only blobs in the date range
+    plan: List[Tuple[str, str]] = []
+
+    for d in daterange(start, end):
+        yyyy = f"{d.year:04d}"
+        mm = f"{d.month:02d}"
+        dd = f"{d.day:02d}"
+
+        # FolderA/YYYY/MM/dd/
+        src_prefix = join_prefix(src_folder, f"{yyyy}/{mm}/{dd}/")
+        names = retry(lambda: list_csv_blobs_for_prefix(src_cc, src_prefix), what=f"list {src_prefix}")
+
+        if not names:
+            continue
+
+        dst_prefix = join_prefix(dst_folder, f"{yyyy}/{mm}/{dd}/")
+
+        for src_blob_name in names:
+            filename = src_blob_name[len(norm_prefix(src_prefix)):]  # relative under that date folder
+            dst_blob_name = join_prefix(dst_prefix, filename)
+            plan.append((src_blob_name, dst_blob_name))
+
+    total = len(plan)
+    print(f"[info] planned={total} files | range={args.start_date}..{args.end_date} | workers={workers} | overwrite={overwrite}")
+
+    if args.dry_run:
+        for s, t in plan[:200]:
+            print(f"DRYRUN: {src['account']}/{src['container']}/{s} -> {dst['account']}/{dst['container']}/{t}")
+        if total > 200:
+            print(f"[info] (showing first 200 of {total})")
+        return
+
+    if total == 0:
+        print("[info] nothing to copy.")
+        return
+
+    copied = skipped = failed = 0
+
+    def worker(item: Tuple[str, str]) -> str:
+        s_name, t_name = item
+        s_blob = src_cc.get_blob_client(s_name)
+        t_blob = dst_cc.get_blob_client(t_name)
+        return copy_blob_streaming(s_blob, t_blob, overwrite=overwrite)
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(worker, it): it for it in plan}
+        for i, fut in enumerate(as_completed(futs), 1):
+            s_name, t_name = futs[fut]
+            try:
+                res = fut.result()
+                if res == "skipped_exists":
+                    skipped += 1
+                else:
+                    copied += 1
+
+                if i % 100 == 0 or i == total:
+                    print(f"[progress] {i}/{total} | copied={copied} skipped={skipped} failed={failed}")
+            except Exception as e:
+                failed += 1
+                print(f"[error] {s_name} -> {t_name}: {e}", file=sys.stderr)
+
+    print(f"[done] total={total} copied={copied} skipped={skipped} failed={failed}")
+    if failed:
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
+
