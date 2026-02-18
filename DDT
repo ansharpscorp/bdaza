@@ -1,0 +1,26 @@
+DimDateTime =
+VAR StartDateTime =
+    MIN ( tblGold_Agg_Subnet_5m[bucket_end_time] )
+VAR EndDateTime =
+    MAX ( tblGold_Agg_Subnet_5m[bucket_end_time] )
+RETURN
+ADDCOLUMNS (
+    GENERATESERIES (
+        StartDateTime,
+        EndDateTime,
+        TIME ( 0, 5, 0 )   -- 5-minute interval
+    ),
+    "Date", DATE ( YEAR ( [Value] ), MONTH ( [Value] ), DAY ( [Value] ) ),
+    "Year", YEAR ( [Value] ),
+    "Month Number", MONTH ( [Value] ),
+    "Month Name", FORMAT ( [Value], "MMM" ),
+    "YearMonth", FORMAT ( [Value], "YYYY-MM" ),
+    "Day", DAY ( [Value] ),
+    "Hour", HOUR ( [Value] ),
+    "Minute", MINUTE ( [Value] ),
+    "Time", FORMAT ( [Value], "HH:mm" ),
+    "Day of Week Number", WEEKDAY ( [Value], 2 ),
+    "Day of Week Name", FORMAT ( [Value], "dddd" ),
+    "Is Weekend",
+        IF ( WEEKDAY ( [Value], 2 ) > 5, TRUE (), FALSE () )
+)
