@@ -1,0 +1,68 @@
+CQD_Glossary =
+DATATABLE(
+    "Metric", STRING,
+    "Definition", STRING,
+    "Threshold / Interpretation", STRING,
+    {
+        {
+            "Avg Jitter",
+            "Variation in packet arrival time during a call.",
+            "<20 ms = Good | 20–30 ms = Noticeable | >30 ms = Poor"
+        },
+        {
+            "Avg Round Trip Time",
+            "Time taken for audio packet to travel to the other endpoint and return.",
+            "<100 ms = Good | 100–200 ms = Acceptable | >200 ms = Poor"
+        },
+        {
+            "Packet Loss Rate",
+            "Percentage of packets lost during transmission.",
+            "<1% = Good | 1–3% = Acceptable | >3% = Poor"
+        },
+        {
+            "Severity Score",
+            "Composite score derived from jitter, RTT, and packet loss to indicate network degradation severity.",
+            "0–30% = Low | 30–60% = Medium | >60% = Critical"
+        },
+        {
+            "Incident Hour",
+            "An hour where network metrics crossed defined thresholds and service degradation occurred.",
+            "Used to detect service impact windows."
+        },
+        {
+            "Impact Duration",
+            "Total number of hours a subnet, user, or reflexive IP experienced degraded performance.",
+            "Higher duration indicates recurring or prolonged issues."
+        },
+        {
+            "Users Impacted",
+            "Maximum number of users affected during a network degradation event.",
+            "Higher value indicates broader service disruption."
+        },
+        {
+            "Subnet",
+            "Network subnet from which user traffic originated.",
+            "Used to detect location or office-specific network issues."
+        },
+        {
+            "Reflexive IP",
+            "Public IP address used by Teams traffic to reach Microsoft services.",
+            "Helps identify unstable network gateways or NAT devices."
+        },
+        {
+            "Connection Type",
+            "Network connection used by the endpoint.",
+            "Wifi = wireless | Wired = LAN | MobileBB = mobile broadband"
+        },
+        {
+            "Endpoint Type",
+            "Device type or platform used by the user.",
+            "Examples: Teams Desktop, VDI, Android, iOS, PSTN"
+        },
+        {
+            "Likely Cause",
+            "Machine-learning generated inference of the most probable root cause of network degradation.",
+            "Examples: WiFi congestion, Mobile broadband variability, VDI latency."
+        }
+    }
+)
