@@ -7,47 +7,52 @@ DATATABLE(
         {
             "Avg Jitter",
             "Variation in packet arrival time during a call.",
-            "<20 ms = Good | 20–30 ms = Noticeable | >30 ms = Poor"
+            "< 20 ms = Good | 20–30 ms = Noticeable | > 30 ms = Poor"
         },
         {
             "Avg Round Trip Time",
-            "Time taken for audio packet to travel to the other endpoint and return.",
-            "<100 ms = Good | 100–200 ms = Acceptable | >200 ms = Poor"
+            "Time taken for a packet to travel to the other endpoint and return.",
+            "< 100 ms = Good | 100–200 ms = Acceptable | > 200 ms = Poor"
         },
         {
             "Packet Loss Rate",
             "Percentage of packets lost during transmission.",
-            "<1% = Good | 1–3% = Acceptable | >3% = Poor"
+            "< 1% = Good | 1–3% = Acceptable | > 3% = Poor"
         },
         {
             "Severity Score",
-            "Composite score derived from jitter, RTT, and packet loss to indicate network degradation severity.",
-            "0–30% = Low | 30–60% = Medium | >60% = Critical"
+            "Composite score derived from jitter, RTT, and packet loss to indicate call quality degradation severity.",
+            "0–30% = Low | 30–50% = Medium | 50–70% = High | > 70% = Critical"
+        },
+        {
+            "Severity Band",
+            "Categorization of Severity Score into human-readable bands for reporting.",
+            "Low: < 30% | Medium: 30–50% | High: 50–70% | Critical: > 70%"
         },
         {
             "Incident Hour",
-            "An hour where network metrics crossed defined thresholds and service degradation occurred.",
-            "Used to detect service impact windows."
+            "An hour where thresholds were exceeded and a degraded service condition is detected.",
+            "Used to identify time windows of service impact (hour-by-hour)."
         },
         {
-            "Impact Duration",
-            "Total number of hours a subnet, user, or reflexive IP experienced degraded performance.",
-            "Higher duration indicates recurring or prolonged issues."
+            "Impact Duration (Hours)",
+            "Total number of hours with degraded performance for a subnet/reflexive IP/user in the selected period.",
+            "Higher duration = recurring or prolonged issue."
         },
         {
-            "Users Impacted",
-            "Maximum number of users affected during a network degradation event.",
-            "Higher value indicates broader service disruption."
+            "Users Impacted (Peak)",
+            "Maximum number of impacted users during an incident or degraded hour window.",
+            "Higher value indicates broader business impact."
         },
         {
             "Subnet",
-            "Network subnet from which user traffic originated.",
-            "Used to detect location or office-specific network issues."
+            "Network subnet from which the affected endpoint originated.",
+            "Used to detect site/office/network-segment specific issues."
         },
         {
             "Reflexive IP",
-            "Public IP address used by Teams traffic to reach Microsoft services.",
-            "Helps identify unstable network gateways or NAT devices."
+            "Public IP address used by the client NAT/egress path for Teams traffic.",
+            "Useful to identify unstable gateways or ISP/WAN issues affecting multiple subnets."
         },
         {
             "Connection Type",
@@ -55,14 +60,19 @@ DATATABLE(
             "Wifi = wireless | Wired = LAN | MobileBB = mobile broadband"
         },
         {
+            "WiFi Band",
+            "Wireless band used when Connection Type is WiFi.",
+            "2.4GHz: more interference/congestion | 5GHz: higher capacity but shorter range"
+        },
+        {
             "Endpoint Type",
-            "Device type or platform used by the user.",
+            "Device/platform category used by the endpoint.",
             "Examples: Teams Desktop, VDI, Android, iOS, PSTN"
         },
         {
             "Likely Cause",
-            "Machine-learning generated inference of the most probable root cause of network degradation.",
-            "Examples: WiFi congestion, Mobile broadband variability, VDI latency."
+            "Rule/ML-based inference of the most probable root cause for the degraded condition.",
+            "Examples: WiFi 2.4GHz congestion, MobileBB variability, VDI optimization issue, ISP/WAN degradation."
         }
     }
 )
